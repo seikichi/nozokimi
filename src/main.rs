@@ -53,40 +53,29 @@ fn main() -> Result<(), Box<std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let addr = addr.parse::<SocketAddr>()?;
-
-    let socket = TcpListener::bind(&addr)?;
+    let listener = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
-    let future = socket
+    let future = listener
         .incoming()
         .map_err(|e| println!("ERROR {:?}", e))
-        .for_each(move |socket| {
-            let (conn_r, conn_w) = socket.split();
-            let lines = io::lines(std::io::BufReader::new(conn_r));
-            let f = Head::new(lines)
+        .for_each(move |conn| {
+            let f = Head::new(io::lines(std::io::BufReader::new(conn)))
                 .and_then(|(head, stream)| {
-                    let conn_r = stream.into_inner();
-                    io::write_all(conn_w, "HTTP/1.1 200 OK\r\n\r\n").and_then(move |(conn_w, _)| {
-                        let host = {
-                            let mut h = head[0].split(' ');
-                            h.next();
-                            h.next().unwrap()
-                        };
-                        let addr = host.to_socket_addrs().unwrap().next().unwrap();
-                        TcpStream::connect(&addr).and_then(move |socket| {
-                            let (dest_r, dest_w) = socket.split();
-                            tokio::spawn(
-                                io::copy(conn_r, dest_w)
-                                    .and_then(|_| Ok(()))
-                                    .map_err(|e| println!("ERROR {:?}", e)),
-                            );
-                            tokio::spawn(
-                                io::copy(dest_r, conn_w)
-                                    .and_then(|_| Ok(()))
-                                    .map_err(|e| println!("ERROR {:?}", e)),
-                            );
-                            Ok(())
-                        })
+                    let conn = stream.into_inner().into_inner();
+                    (io::write_all(conn, "HTTP/1.1 200 OK\r\n\r\n"), Ok(head))
+                })
+                .and_then(move |((conn, _), head)| {
+                    let addr = {
+                        let h = head[0].split(' ').collect::<Vec<_>>();
+                        h[1].to_socket_addrs().unwrap().next().unwrap()
+                    };
+                    TcpStream::connect(&addr).and_then(move |dest| {
+                        let (conn_r, conn_w) = conn.split();
+                        let (dest_r, dest_w) = dest.split();
+                        tokio::spawn(io::copy(conn_r, dest_w).map(|_| ()).map_err(|_| ()));
+                        tokio::spawn(io::copy(dest_r, conn_w).map(|_| ()).map_err(|_| ()));
+                        Ok(())
                     })
                 })
                 .map_err(|e| println!("ERROR {:?}", e));
