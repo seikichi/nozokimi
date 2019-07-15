@@ -1,0 +1,9 @@
+[package]
+name = "nozokimi"
+version = "0.1.0"
+authors = ["Seiichi KONDO <seikichi@kmc.gr.jp>"]
+edition = "2018"
+
+[dependencies]
+tokio = "0.1"
+futures = "0.1"
