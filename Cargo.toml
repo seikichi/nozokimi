@@ -6,4 +6,6 @@ edition = "2018"
 
 [dependencies]
 tokio = "0.1"
+native-tls = "0.2"
+tokio-tls = "0.2"
 futures = "0.1"

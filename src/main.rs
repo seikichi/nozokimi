@@ -1,9 +1,12 @@
 use futures::try_ready;
+use native_tls;
+use native_tls::Identity;
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
+use tokio_tls::{TlsAcceptor, TlsConnector};
 
 #[derive(Debug)]
 pub struct Head<T> {
@@ -56,25 +59,51 @@ fn main() -> Result<(), Box<std::error::Error>> {
     let listener = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
 
+    let der = include_bytes!("../identity.p12");
+    let cert = Identity::from_pkcs12(der, "mypass")?;
+    let acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(cert).build()?);
+    let connector = TlsConnector::from(native_tls::TlsConnector::builder().build().unwrap());
+
     let future = listener
         .incoming()
         .map_err(|e| println!("ERROR {:?}", e))
         .for_each(move |conn| {
+            let acceptor = acceptor.clone();
+            let connector = connector.clone();
             let f = Head::new(io::lines(std::io::BufReader::new(conn)))
                 .and_then(|(head, stream)| {
                     let conn = stream.into_inner().into_inner();
                     (io::write_all(conn, "HTTP/1.1 200 OK\r\n\r\n"), Ok(head))
                 })
                 .and_then(move |((conn, _), head)| {
-                    let addr = {
-                        let h = head[0].split(' ').collect::<Vec<_>>();
-                        h[1].to_socket_addrs().unwrap().next().unwrap()
-                    };
+                    let host = head[0].split(' ').collect::<Vec<_>>()[1].to_owned();
+                    let domain = host.split(':').collect::<Vec<_>>()[0].to_owned();
+                    let addr = host.to_socket_addrs().unwrap().next().unwrap();
+
+                    println!("{:?}, {:?}", host, addr);
                     TcpStream::connect(&addr).and_then(move |dest| {
-                        let (conn_r, conn_w) = conn.split();
-                        let (dest_r, dest_w) = dest.split();
-                        tokio::spawn(io::copy(conn_r, dest_w).map(|_| ()).map_err(|_| ()));
-                        tokio::spawn(io::copy(dest_r, conn_w).map(|_| ()).map_err(|_| ()));
+                        let connect = connector
+                            .connect(&domain, dest)
+                            .and_then(move |dest| {
+                                let accept = acceptor
+                                    .accept(conn)
+                                    .and_then(move |conn| {
+                                        let (conn_r, conn_w) = conn.split();
+                                        let (dest_r, dest_w) = dest.split();
+                                        tokio::spawn(
+                                            io::copy(conn_r, dest_w).map(|_| ()).map_err(|_| ()),
+                                        );
+                                        tokio::spawn(
+                                            io::copy(dest_r, conn_w).map(|_| ()).map_err(|_| ()),
+                                        );
+                                        Ok(())
+                                    })
+                                    .map_err(|_| ());
+                                tokio::spawn(accept);
+                                Ok(())
+                            })
+                            .map_err(|_| ());
+                        tokio::spawn(connect);
                         Ok(())
                     })
                 })
