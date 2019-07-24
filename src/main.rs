@@ -1,116 +1,48 @@
-use futures::try_ready;
-use native_tls;
-use native_tls::Identity;
+#![feature(await_macro, async_await)]
+
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs};
-use tokio::io;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
-use tokio_tls::{TlsAcceptor, TlsConnector};
 
-#[derive(Debug)]
-pub struct Head<T> {
-    stream: Option<T>,
-    lines: Vec<String>,
-}
-
-impl<T> Head<T>
-where
-    T: Stream<Item = String>,
-{
-    pub fn new(stream: T) -> Self {
-        Self {
-            stream: Some(stream),
-            lines: vec![],
-        }
-    }
-}
-
-impl<T> Future for Head<T>
-where
-    T: Stream<Item = String>,
-{
-    type Item = (Vec<String>, T);
-    type Error = T::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        loop {
-            let line = match try_ready!(self.stream.as_mut().unwrap().poll()) {
-                None => break,
-                Some(value) => value,
-            };
-            if line.is_empty() {
-                break;
-            }
-            self.lines.push(line);
-        }
-        Ok(Async::Ready((
-            std::mem::replace(&mut self.lines, vec![]),
-            self.stream.take().unwrap(),
-        )))
-    }
-}
-
-fn main() -> Result<(), Box<std::error::Error>> {
+#[tokio::main]
+async fn main() {
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let addr = addr.parse::<SocketAddr>()?;
-    let listener = TcpListener::bind(&addr)?;
+    let addr = addr.parse::<SocketAddr>().unwrap();
+    let mut listener = TcpListener::bind(&addr).unwrap();
     println!("Listening on: {}", addr);
 
-    let der = include_bytes!("../identity.p12");
-    let cert = Identity::from_pkcs12(der, "mypass")?;
-    let acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(cert).build()?);
-    let connector = TlsConnector::from(native_tls::TlsConnector::builder().build().unwrap());
+    loop {
+        let (mut src, _) = listener.accept().await.unwrap();
 
-    let future = listener
-        .incoming()
-        .map_err(|e| println!("ERROR {:?}", e))
-        .for_each(move |conn| {
-            let acceptor = acceptor.clone();
-            let connector = connector.clone();
-            let f = Head::new(io::lines(std::io::BufReader::new(conn)))
-                .and_then(|(head, stream)| {
-                    let conn = stream.into_inner().into_inner();
-                    (io::write_all(conn, "HTTP/1.1 200 OK\r\n\r\n"), Ok(head))
-                })
-                .and_then(move |((conn, _), head)| {
-                    let host = head[0].split(' ').collect::<Vec<_>>()[1].to_owned();
-                    let domain = host.split(':').collect::<Vec<_>>()[0].to_owned();
-                    let addr = host.to_socket_addrs().unwrap().next().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0; 1024];
+            let mut headers: Vec<u8> = vec![];
+            while !headers.ends_with(b"\r\n\r\n") {
+                let n = src.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                headers.extend(&buf[0..n]);
+            }
 
-                    println!("{:?}, {:?}", host, addr);
-                    TcpStream::connect(&addr).and_then(move |dest| {
-                        let connect = connector
-                            .connect(&domain, dest)
-                            .and_then(move |dest| {
-                                let accept = acceptor
-                                    .accept(conn)
-                                    .and_then(move |conn| {
-                                        let (conn_r, conn_w) = conn.split();
-                                        let (dest_r, dest_w) = dest.split();
-                                        tokio::spawn(
-                                            io::copy(conn_r, dest_w).map(|_| ()).map_err(|_| ()),
-                                        );
-                                        tokio::spawn(
-                                            io::copy(dest_r, conn_w).map(|_| ()).map_err(|_| ()),
-                                        );
-                                        Ok(())
-                                    })
-                                    .map_err(|_| ());
-                                tokio::spawn(accept);
-                                Ok(())
-                            })
-                            .map_err(|_| ());
-                        tokio::spawn(connect);
-                        Ok(())
-                    })
-                })
-                .map_err(|e| println!("ERROR {:?}", e));
-            tokio::spawn(f)
+            let mut buf = [httparse::EMPTY_HEADER; 16];
+            let mut req = httparse::Request::new(&mut buf);
+            req.parse(&headers).unwrap();
+            if req.method != Some("CONNECT") {
+                return;
+            }
+            src.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+
+            let path = req.path.unwrap();
+            let addr = path.to_socket_addrs().unwrap().next().unwrap();
+            let dst = TcpStream::connect(&addr).await.unwrap();
+            let (mut src_r, mut src_w) = src.split();
+            let (mut dst_r, mut dst_w) = dst.split();
+            tokio::spawn(async move { src_r.copy(&mut dst_w).await.map(|_| ()).unwrap() });
+            tokio::spawn(async move { dst_r.copy(&mut src_w).await.map(|_| ()).unwrap() });
         });
-
-    tokio::run(future);
-    Ok(())
+    }
 }
